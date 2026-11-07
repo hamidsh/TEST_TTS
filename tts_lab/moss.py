@@ -1,8 +1,22 @@
 """MossTTSDelay adapter. Heavy imports happen only in the isolated worker."""
+from contextlib import nullcontext
 from pathlib import Path
 import hashlib
 import json
 import time
+
+
+def codec_precision_context(codec):
+    """MOSS quantizers explicitly produce FP32 activations even with BF16 weights.
+
+    Autocast the codec operations, including Conv1d, using its own device/dtype.
+    Keep this scope separate from the language model and its quantization.
+    """
+    import torch
+    parameter = next(codec.parameters())
+    if parameter.dtype in (torch.bfloat16, torch.float16):
+        return torch.autocast(device_type=parameter.device.type, dtype=parameter.dtype)
+    return nullcontext()
 
 
 def load_local_processor(model_path, codec_path, codec_device, codec_dtype):
@@ -89,7 +103,8 @@ class MossBackend:
                     import soundfile as sf
                     wav, rate = sf.read(reference, dtype='float32', always_2d=True)
                     waveform = torch.from_numpy(wav.mean(axis=1)).unsqueeze(0)
-                    codes = self.processor.encode_audios_from_wav([waveform], rate)[0]
+                    with codec_precision_context(self.processor.audio_tokenizer):
+                        codes = self.processor.encode_audios_from_wav([waveform], rate)[0]
                     self.reference_cache.clear()  # bounded: keep only the most recent voice
                     self.reference_cache[key] = codes.detach().cpu()
                 reference_codes = [self.reference_cache[key]]
@@ -112,7 +127,8 @@ class MossBackend:
             truncated = token_sequence.shape[0] - prompt_length >= options['max_new_tokens']
             emit('Decoding waveform …')
             decode_start = time.perf_counter()
-            messages = self.processor.decode(output)
+            with codec_precision_context(self.processor.audio_tokenizer):
+                messages = self.processor.decode(output)
             if not messages or not messages[0] or not messages[0].audio_codes_list:
                 raise RuntimeError('Model returned no decodable audio. Try a shorter sentence or a higher token limit.')
             audio = messages[0].audio_codes_list[0].detach().float().cpu().numpy().reshape(-1)
