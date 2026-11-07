@@ -1,7 +1,37 @@
 """MossTTSDelay adapter. Heavy imports happen only in the isolated worker."""
 from pathlib import Path
 import hashlib
+import json
 import time
+
+
+def load_local_processor(model_path, codec_path, codec_device, codec_dtype):
+    """Construct from components: MOSS's loader leaks load kwargs into ProcessorMixin.
+
+    In particular torch_dtype/device_map/local_files_only are load options, not
+    processor constructor options. Keep offline loading on every component.
+    """
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    metadata = json.loads((Path(model_path) / 'processor_config.json').read_text(encoding='utf-8'))
+    class_ref = metadata.get('auto_map', {}).get('AutoProcessor')
+    if not isinstance(class_ref, str) or '.' not in class_ref or '--' in class_ref:
+        raise ValueError('processor_config.json must specify a local AutoProcessor class.')
+    processor_class = get_class_from_dynamic_module(
+        class_ref, model_path, local_files_only=True,
+    )
+    local = dict(trust_remote_code=True, local_files_only=True)
+    model_config = AutoConfig.from_pretrained(model_path, **local)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, **local)
+    codec = AutoModel.from_pretrained(
+        codec_path, torch_dtype=codec_dtype,
+        device_map={'': codec_device}, **local,
+    ).eval()
+    # Only the three documented components reach the strict constructor.
+    return processor_class(
+        tokenizer=tokenizer, audio_tokenizer=codec, model_config=model_config,
+    )
 
 
 class MossBackend:
@@ -11,19 +41,16 @@ class MossBackend:
 
     def load(self, cfg, emit):
         import torch
-        from transformers import AutoModel, AutoProcessor, BitsAndBytesConfig
+        from transformers import AutoModel, BitsAndBytesConfig
         torch.set_num_threads(cfg.threads)
         if (cfg.placement != 'cpu' or cfg.codec_device == 'cuda') and not torch.cuda.is_available():
             raise RuntimeError('CUDA is unavailable. Install the CUDA torch build or select CPU for both components.')
         common = dict(trust_remote_code=True, local_files_only=True)
         emit('Loading audio codec + text tokenizer …')
-        # These kwargs apply ONLY to the codec, never to the language model.
-        self.processor = AutoProcessor.from_pretrained(
-            cfg.model_path, codec_path=cfg.codec_path,
-            torch_dtype=torch.float32 if cfg.codec_device == 'cpu' else torch.bfloat16,
-            device_map={'': cfg.codec_device}, **common,
+        self.processor = load_local_processor(
+            cfg.model_path, cfg.codec_path, cfg.codec_device,
+            torch.float32 if cfg.codec_device == 'cpu' else torch.bfloat16,
         )
-        self.processor.audio_tokenizer.eval()
         emit('Loading language model shards … (first load can take several minutes)')
         kwargs = dict(torch_dtype=torch.bfloat16, attn_implementation='sdpa', low_cpu_mem_usage=True)
         if cfg.placement == 'nf4':
